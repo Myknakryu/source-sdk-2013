@@ -53,8 +53,161 @@ static const char* GetWebBaseUrl()
 	case k_EUniversePublic:
 	default:
 		return "https://www.teamfortress.com/";
+		// return "http://127.0.0.1:8080/";
 	}
 }
+
+
+#include <curl/curl.h>
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <string>
+
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
+{
+    size_t totalSize = size * nmemb;
+    std::string* outString = static_cast<std::string*>(userp);
+    if (outString && totalSize > 0)
+    {
+        outString->append((char*)contents, totalSize);
+    }
+    return totalSize;
+}
+
+static std::mutex g_completedRequestsMutex;
+static std::vector<std::pair<AsyncHTTPResult, AsyncHTTPCallback>> g_completedRequests;
+
+
+void StartAsyncGetRequest(const std::string& url, const std::string& appid, const std::string& msg, const std::string& ticket, AsyncHTTPCallback callback)
+{
+    std::thread worker([url, appid, msg, ticket, callback]()
+    {
+        AsyncHTTPResult result;
+        result.url = url;
+        std::string responseBuffer;
+        CURL* curl = curl_easy_init();
+
+        if (!curl)
+        {
+            result.success = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+                g_completedRequests.push_back({result, callback});
+            }
+            return;
+        }
+
+        char* encodedUrl = curl_easy_escape(curl, appid.c_str(), 0);
+        if (!encodedUrl)
+        {
+            result.success = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+                g_completedRequests.push_back({result, callback});
+            }
+            curl_easy_cleanup(curl);
+            return;
+        }
+
+        std::string newId = "?appid=" + std::string(encodedUrl);
+        curl_free(encodedUrl);
+		encodedUrl = curl_easy_escape(curl, msg.c_str(), 0);
+        if (!encodedUrl)
+        {
+            result.success = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+                g_completedRequests.push_back({result, callback});
+            }
+            curl_easy_cleanup(curl);
+            return;
+        }
+
+        std::string newMsg = "&msg=" + std::string(encodedUrl);
+        curl_free(encodedUrl);
+		encodedUrl = curl_easy_escape(curl, ticket.c_str(), 0);
+        if (!encodedUrl)
+        {
+            result.success = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+                g_completedRequests.push_back({result, callback});
+            }
+            curl_easy_cleanup(curl);
+            return;
+        }
+
+        std::string newTicket = "&ticket=" + std::string(encodedUrl);
+        curl_free(encodedUrl);
+
+		std::string finalUrl = url + newId + newMsg + newTicket;
+        curl_easy_setopt(curl, CURLOPT_URL, finalUrl.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+		struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "user-agent: Valve/Steam HTTP Client 1.0 (243750)");
+        headers = curl_slist_append(headers, "Accept: text/html,*/*;q=0.9");
+        headers = curl_slist_append(headers, "accept-encoding: gzip,identity,*;q=0");
+        headers = curl_slist_append(headers, "accept-charset: ISO-8859-1,utf-8,*;q=0.7");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        // Msg("---- Asking URL %s ----\n", finalUrl.c_str());
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK)
+        {
+            long httpCode = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+            result.success = true;
+            result.statusCode = httpCode;
+            result.responseBody = responseBuffer;
+        }
+        else
+        {
+            result.success = false;
+            result.statusCode = 0;
+        }
+
+        curl_easy_cleanup(curl);
+
+        {
+            std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+            g_completedRequests.push_back({result, callback});
+        }
+    });
+
+    worker.detach();
+}
+
+
+void ProcessCompletedRequests()
+{
+    std::vector<std::pair<AsyncHTTPResult, AsyncHTTPCallback>> localQueue;
+
+    {
+        std::lock_guard<std::mutex> lock(g_completedRequestsMutex);
+        localQueue.swap(g_completedRequests);
+    }
+
+    for (auto& entry : localQueue)
+    {
+        const AsyncHTTPResult&   result   = entry.first;
+        const AsyncHTTPCallback& callback = entry.second;
+        
+        if (callback)
+        {
+            callback(result);
+        }
+    }
+}
+
+using AsyncHTTPCallback = std::function<void(const AsyncHTTPResult&)>;
 
 // How many minutes before we assume something is FUBAR and reboot if we're empty and waiting for the GC to acknowledge
 // us.
@@ -1485,6 +1638,8 @@ void CTFGCServerSystem::PreClientUpdate( )
 	CRTime::UpdateRealTime();
 
 	WebapiEquipmentThink();
+
+	ProcessCompletedRequests(); 
 
 	if ( GCClientSystem()->BConnectedtoGC() )
 	{
@@ -4116,35 +4271,48 @@ void CTFGCServerSystem::WebapiEquipmentThinkRequest( CSteamID steamID, WebapiEqu
 	{
 		Assert( state.m_pKVCurrentRequest != nullptr );
 		KeyValues* pKV = state.m_pKVCurrentRequest;
-
-		if ( !SteamHTTP() )
-			return;
+		// Msg("--- Requesting inventory ---\n");
+		// if ( !SteamHTTP() )
+		// 	return;
 
 		// Request inventory from teamfortress.com webapi
 		CFmtStr strUrl( "%swebapi/ISDK/GetEquipment/v0001", GetWebBaseUrl() );
+		// CFmtStr strUrl( "%s", GetWebBaseUrl() );
 
 		state.m_EquipmentRequestCompleted.Cancel();
-		state.m_hEquipmentRequest = SteamHTTP()->CreateHTTPRequest( k_EHTTPMethodGET, strUrl.Get() );
-		if ( state.m_hEquipmentRequest == INVALID_HTTPREQUEST_HANDLE )
-		{
-			// try again next frame
-			return;
-		}
+		// state.m_hEquipmentRequest = SteamHTTP()->CreateHTTPRequest( k_EHTTPMethodGET, strUrl.Get() );
+		// if ( state.m_hEquipmentRequest == INVALID_HTTPREQUEST_HANDLE )
+		// {
+		// 	// try again next frame
+		// 	return;
+		// }
 
 		// This mod's appid (NOT tf2's appid)
-		SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "appid", CNumStr( engine->GetAppID() ) );
+		// SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "appid", CNumStr( engine->GetAppID() ) );
 
-		// Item list
-		SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "msg", pKV->GetString( "msg", nullptr ) );
+		// // Item list
+		// SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "msg", pKV->GetString( "msg", nullptr ) );
 
-		// Authentication token
-		SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "ticket", pKV->GetString( "ticket", nullptr ) );
+		// // Authentication token
+		// SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "ticket", pKV->GetString( "ticket", nullptr ) );
 
-		if ( GetUniverse() != k_EUniversePublic )
-		{
+		// Msg("appid: %d\n\n", engine->GetAppID());
+		// Msg("msg: %s\n\n", pKV->GetString("msg", ""));
+		// Msg("ticket: %s\n\n", pKV->GetString("ticket", ""));
+
+		std::string fullUrl = GetWebBaseUrl() + std::string("webapi/ISDK/GetEquipment/v0001");
+		std::string appid =  std::to_string(engine->GetAppID());
+		std::string msg =  std::string(pKV->GetString("msg", ""));
+		std::string ticket =  std::string(pKV->GetString("ticket", ""));
+		// Msg("appid: %d\n\n", engine->GetAppID());
+		// Msg("msg: %s\n\n", pKV->GetString("msg", ""));
+		// Msg("ticket: %s\n\n", pKV->GetString("ticket", ""));
+
+		// if ( GetUniverse() != k_EUniversePublic )
+		// {
 			// use beta tf2 appid on non public universes
-			SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "game_appid", "810" );
-		}
+			// SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hEquipmentRequest, "game_appid", "810" );
+		// }
 
 		// Is there a way we can validate the existing so cache?  We could only request the new items.
 		// Right now we only expect this message rarely so let's just ask for all the items each time.
@@ -4158,15 +4326,23 @@ void CTFGCServerSystem::WebapiEquipmentThinkRequest( CSteamID steamID, WebapiEqu
 		//{
 		//	SteamHTTP()->SetHTTPRequestGetOrPostParameter( state.m_hInventoryRequest, "version", CNumStr( pExistingSOCache->GetVersion() ) );
 		//}
+		// Msg("--- Sending requests ---\n");
 
-		SteamAPICall_t callResult;
-		if ( !SteamHTTP()->SendHTTPRequest( state.m_hEquipmentRequest, &callResult ) )
+		// SteamAPICall_t callResult;
+		// if ( !SteamHTTP()->SendHTTPRequest( state.m_hEquipmentRequest, &callResult ) )
+		// {
+		// 	state.Backoff();
+		// 	return;
+		// }
+
+		// sleep(1);
+		StartAsyncGetRequest(fullUrl, appid, msg, ticket, [this, steamID](const AsyncHTTPResult& result)
 		{
-			state.Backoff();
-			return;
-		}
+			this->OnWebapiEquipmentReceivedCurl(steamID, result);
+		});
 
-		state.m_EquipmentRequestCompleted.Set( callResult, pState, &WebapiEquipmentState_t::OnWebapiEquipmentReceived );
+
+		// state.m_EquipmentRequestCompleted.Set( callResult, pState, &WebapiEquipmentState_t::OnWebapiEquipmentReceived );
 		state.m_eState = kWebapiEquipmentState_WaitingForInventory;
 		break;
 	}
@@ -4334,6 +4510,79 @@ void CTFGCServerSystem::OnWebapiEquipmentReceived( CSteamID steamID, HTTPRequest
 	// We were successful, clear backoff timers
 	state.RequestSucceeded();
 	state.m_eState = kWebapiEquipmentState_InventoryReceived;
+}
+
+
+void CTFGCServerSystem::OnWebapiEquipmentReceivedCurl(CSteamID steamID, const AsyncHTTPResult& result)
+{
+    // Msg("---- OnWebapiEquipmentReceived (async curl) ----\n");
+
+    WebapiEquipmentState_t& state = FindOrCreateWebapiEquipmentState(steamID);
+
+    if (state.m_eState != kWebapiEquipmentState_WaitingForInventory){
+		// Msg("--- Well shit... not waiting ---\n");
+        return;
+	}
+
+    state.m_eState = kWebapiEquipmentState_RequestInventory;
+
+    if (!result.success || result.statusCode != 200)
+    {
+        Msg("Async request failed or status != 200\n");
+        return;
+    }
+
+    GCSDK::CWebAPIValues* pValues = GCSDK::CWebAPIValues::ParseJSON(result.responseBody.c_str());
+    if (!pValues)
+    {
+        Msg("Invalid JSON response\n");
+        return;
+    }
+
+    int nResult = pValues->GetChildInt32Value("result", k_EResultNone);
+    switch(nResult)
+    {
+        case k_EResultOK:
+            break;
+		default:
+			return;
+        // ...
+    }
+
+	CSteamID resultSteamID( pValues->GetChildUInt64Value( "steamID" ) );
+	if ( resultSteamID != steamID )
+	{
+		Msg( "Equipment response has bad owner steam id (%s, expected %s)\n", resultSteamID.Render(), steamID.Render() );
+		return;
+	}
+
+	if ( pValues->FindChild( "msg" ) )
+	{
+		CUtlBuffer bufMsgSubscription;
+		if ( !pValues->BGetChildBinaryValue( bufMsgSubscription, "msg" ) )
+		{
+			Msg( "Equipment response failed to extract inventory msg\n" );
+			return;
+		}
+
+		CGCClientSharedObjectCache *pSOCache = GetGCClient()->AddLocalSOCache( steamID, bufMsgSubscription.Base(), bufMsgSubscription.TellPut() );
+		if ( !pSOCache )
+		{
+			Msg( "Inventory response failed to create SO cache (probably protobuf didn't parse)\n" );
+			return;
+		}
+
+		SDK_ApplyInventoryInfo( pSOCache, state.m_pKVCurrentRequest );
+
+		Assert( pSOCache->GetVersion() == pValues->GetChildUInt64Value( "version" ) );
+	}
+	else
+	{
+		Msg( "Inventory response missing inventory msg\n" );
+	}
+
+    state.RequestSucceeded();
+    state.m_eState = kWebapiEquipmentState_InventoryReceived;
 }
 
 void CTFGCServerSystem::SDK_ApplyInventoryInfo(CGCClientSharedObjectCache* pCache, KeyValues* pKVRequest)

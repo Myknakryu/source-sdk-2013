@@ -36,6 +36,15 @@ class CReliableMessageQueue;
 
 #ifdef ENABLE_GC_MATCHMAKING
 
+struct AsyncHTTPResult
+{
+    std::string url;
+    bool        success     = false;
+    long        statusCode  = 0;
+    std::string responseBody;
+};
+using AsyncHTTPCallback = std::function<void(const AsyncHTTPResult&)>;
+
 class CMvMVictoryInfo
 {
 public:
@@ -648,7 +657,9 @@ private:
 
 		// Steam callback
 		void OnWebapiEquipmentReceived( HTTPRequestCompleted_t* pInfo, bool bIOFailure );
+
 	};
+	void OnWebapiEquipmentReceivedCurl(CSteamID steamID, const AsyncHTTPResult& result);
 	typedef CUtlMap< CSteamID, WebapiEquipmentState_t*, int, CDefLess<CSteamID> > TMapEquipmentRequests;
 	TMapEquipmentRequests m_mapEquipmentRequests;
 	WebapiEquipmentState_t& FindOrCreateWebapiEquipmentState( CSteamID steamID );
